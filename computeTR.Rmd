@@ -1,0 +1,232 @@
+---
+title: "computeTR_v2"
+author: "Xiaojun Max Xu, Jinting Li"
+date: "02/04/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(reshape2)
+library(ggplot2)
+```
+
+This notebook is NOT ready to run as it is in your setting. One would have to read the comments in detail to make changes accordingly (include file names, path of executables, etc) in order to run it.
+
+
+1. Convert the homerPeak to standard bed files and remove genes of less than 1kb of length.
+The "refGene_hg19_genebody.new.bed" contains the genomic regions for all genes. It can be generated from any genome annotation file. In our case, it was generated from a HOMER peak file. You'd have to change the awk command accordingly if it was a different peak file to start with.
+
+```{bash}
+homerPeakFile=refGene_hg19_genebody.new.bed
+bedFile_gt1kb=refGene.hg19.genes.sorted.gt1kb.bed
+
+awk -v OFS="\t" '{print $2, $3, $4, $1, 0, $5}' $homerPeakFile | sort -k1,1 -k2,2n | awk -v OFS="\t" '$3-$2 > 1000 {print $0}' > $bedFile_gt1kb
+```
+
+Compile the tsr and  first, compute the intensity over tsr, select the transcript with most intense tsr signal, then retrieve the bed, remove overlap, 
+
+2a. compile the tsr regions on the gene.gt1kb.bed file, this tsr bed file will be used only for the gene selection based on intensity. The final tsr and gb bed file will have to be extracted from the original bed file
+
+```{bash}
+bedFile_gt1kb=refGene.hg19.genes.sorted.gt1kb.bed
+
+bedFile_gt1kb_tsr=refGene.hg19.genes.sorted.gt1kb.tsr.bed
+
+[ -e $bedFile_gt1kb_tsr ] && mv $bedFile_gt1kb_tsr $bedFile_gt1kb_tsr".bkp"
+
+while read -r line
+do
+    read -r f1 f2 f3 f4 f5 f6 <<<"$line"
+    # Printing the chromsome region
+    #echo $f1 $f2 $f3 $f4 $f5 $f6
+
+    # calculate the genebody length, extend it by a fixed length that you want
+    if [ "$f6" == "+" ]; then
+        TSS=$(($f2 - 50))
+        TSE=$(($f2 + 300))
+        echo -e $f1'\t'$TSS'\t'$TSE'\t'$f4 >> $bedFile_gt1kb_tsr
+
+    else
+        TSS=$(($f3 - 300))
+        TSE=$(($f3 + 50))
+        echo -e $f1'\t'$TSS'\t'$TSE'\t'$f4 >> $bedFile_gt1kb_tsr
+
+    fi
+done < $bedFile_gt1kb
+```
+
+
+2b. Compute the intesity over whole gene, select the transcript with higher signal, then retrieve the bed, remove overlap. The "control.fc.signal.bigwig" is the bigwig file that you'd like to choose to define the strongest transcript intensity. 
+```{bash}
+#conda activate base
+
+bigwigfile=control.signal.bigwig
+bedFile_gt1kb_tsr=refGene.hg19.genes.sorted.gt1kb.bed
+bw_signal_tsr=control.fc.signal.bw.txt
+
+~/miniconda3/bin/bigWigAverageOverBed $bigwigfile $bedFile_gt1kb_tsr $bw_signal_tsr
+#system("bigWigAverageOverBed $bigwigfile $bedFile_gt1kb $signal_output", intern = TRUE)
+```
+
+2c. Plot the CDF to see how the signal distributes, choose a cutoff based on this 
+
+```{r}
+df <- read.table("control.fc.signal.bw.txt", header = FALSE)
+
+df_meanoverall <- data.frame(df$V5)
+melted_df_meanoverall <- melt(df_meanoverall)
+p0 = ggplot(melted_df_meanoverall, aes(x = value)) + 
+  #xlim(0,10) + 
+  stat_ecdf(aes(group = variable, colour = variable), geom = "point", size = 0.2)
+print(p0)
+```
+
+
+2c.Select the transcripts with highest Pol2 signal intensity over tsr, and apply a cutoff value of mean0 > 0.25
+```{python}
+def selectTranscript(inputfile, outputfile, cutoff): # Build a dictionary of gene names
+    geneDict = {}
+    meanSignalCutoff = cutoff   #
+    with open(inputfile,'r') as infile:
+        for line in infile:
+            array = line.split()
+            regionName = array[0]
+            meanIntensity = float(array[4])
+            gene = regionName.split("!")[1]
+            if meanIntensity >= meanSignalCutoff:
+                if gene not in geneDict:
+                    geneDict[gene] = (line, meanIntensity)
+                elif meanIntensity > geneDict[gene][1]:
+                    geneDict[gene] = (line, meanIntensity)
+    with open(outputfile, 'w') as outfile:
+        for key, value in geneDict.items():
+            outfile.write(value[0])
+    return
+
+inputfile = "control.fc.signal.bw.txt"
+outputfile = "control.fc.signal.bw.uniqGenes.txt"
+cutoff = 0.25 # set the cutoff in here
+
+selectTranscript(inputfile, outputfile, cutoff) #
+```
+
+2d. Use the unique gene regions names to extract the corresponding bed file
+
+```{bash}
+bw_signal_uniqGenes=control.fc.signal.bw.uniqGenes.txt
+bedFile_gt1kb=refGene.hg19.genes.sorted.gt1kb.bed
+bedFile_uniqGenes=refGene.hg19.genes.sorted.gt1kb.uniqGenes.bed
+bedFile_uniqGenes_uniqRegions=refGene.hg19.genes.sorted.gt1kb.uniqGenes.uniqRegions.bed
+
+# Use the peakname (column 1) from bw_singal_uniqGene to extract the corresponding coordinates from bedFile_gt1kb
+awk 'NR==FNR{array[$1]; next} ($4 in array)' $bw_signal_uniqGenes $bedFile_gt1kb > $bedFile_uniqGenes
+
+# This step removes the regions with exact same genomic coordinates. Without this, the bedtools merge will not work in the next step
+awk '!seen[$1$2$3]++' $bedFile_uniqGenes > $bedFile_uniqGenes_uniqRegions
+```
+
+3. Remove overlapped genes and then compile the tsr and gb region bed files. Run bigwigAverageOverbed to obtain the average bigwig signal over the TSR or GB region.
+
+```{bash}
+bigwigfile=sample.fc.signal.bw
+
+bedFile_uniqGenes_uniqRegions=refGene.hg19.genes.sorted.gt1kb.uniqGenes.uniqRegions.bed
+
+bedFile_uniqGenes_uniqRegions_nonOverlap=refGene.hg19.genes.sorted.gt1kb.uniqGenes.uniqRegions.nonOverlap.bed
+
+tsr_bed=refGene.hg19.genes.sorted.gt1kb.uniqGenes.uniqRegions.nonOverlap.tsr.bed
+
+gb_bed=refGene.hg19.genes.sorted.gt1kb.uniqGenes.uniqRegions.nonOverlap.gb.bed
+
+tsr_signal_output=sample.bw.genes.hg19.tsr.txt
+
+gb_signal_output=sample.bw.genes.hg19.gb.txt
+
+distance_cutoff=1000
+
+#Count the overlaps in the original input; To exclude nearby genes, use maximum distance cutoff -d, e.g. -d 2000 to remove genes of less or equal to 2000bp distance
+bedtools merge -i $bedFile_uniqGenes_uniqRegions -d $distance_cutoff -c 1 -o count > counted
+
+#Filter out only those rows that do not overlap with anything
+awk '/\t1$/{print}' counted > filtered
+
+#Intersect it with the original input and keep only those original rows that were found after filtering as well
+bedtools intersect -a $bedFile_uniqGenes_uniqRegions -b filtered -wa > $bedFile_uniqGenes_uniqRegions_nonOverlap
+
+rm counted filtered
+
+# The value of genebodyExtension needs to be adjusted according the cutoff used in removing nearby genes
+# As we used 2000bp as the distance cutoff, the genes in the list now are at least 2kbp apart. Therefore, we can safely extend 2000bp for consecutive genes of the same direction. For consecutive genes of tail to tail direction, we can extend at most 1kbp. As a result, to be on the safe side, extend only 1kp in the calculation
+
+genebodyExtension=$(($distance_cutoff/2))
+echo $genebodyExtension
+[ -e $tsr_bed ] && mv $tsr_bed $tsr_bed".bkp"
+[ -e $gb_bed ] && mv $gb_bed $gb_bed".bkp"
+
+while read -r line
+do
+    read -r f1 f2 f3 f4 f5 f6 <<<"$line"
+    # Printing the chromsome region
+    #echo $f1 $f2 $f3 $f6
+
+    # calculate the genebody length, extend it by a fixed length that you want
+    if [ "$f6" == "+" ]; then
+        TSS=$(($f2 - 50))
+        TSE=$(($f2 + 300))
+        TES=$(($f2 + 301))
+        TEE=$(($f3 + $genebodyExtension))
+        echo -e $f1'\t'$TSS'\t'$TSE'\t'$f4 >> $tsr_bed
+        echo -e $f1'\t'$TES'\t'$TEE '\t'$f4 >> $gb_bed
+    else
+        TSS=$(($f3 - 300))
+        TSE=$(($f3 + 50))
+        TEE=$(($f3 - 301))
+        TES=$(($f2 - $genebodyExtension))
+        echo -e $f1'\t'$TSS'\t'$TSE'\t'$f4 >> $tsr_bed
+        echo -e $f1'\t'$TES'\t'$TEE'\t'$f4 >> $gb_bed
+    fi
+done <"$bedFile_uniqGenes_uniqRegions_nonOverlap"
+
+# Run the following two commands in terminal for now
+#bigWigAverageOverBed $bigwigfile $tsr_bed $tsr_signal_output
+#bigWigAverageOverBed $bigwigfile $gb_bed $gb_signal_output
+```
+
+4. Compute TR using the signal over tsr and gb. Compute for polPro and polDiff separately.
+Note that the bed files were generated with a filtering step that incorporated polPro signal intensity. We are using the bed files for polDiff as well as we want them to be of exact match.
+
+```{r}
+tsrTable <- "sample.bw.genes.hg19.tsr.txt"
+gbTable <- "sample.bw.genes.hg19.gb.txt"
+outputfile <- "sample.bw.genes.hg19.TR.txt"
+
+#Load the bigWigAverageOverBed result to dataframes
+header <- c("name", "size", "covered", "sum", "mean_over_all", "mean_over_exon")
+
+tsr <- read.csv(tsrTable, sep = "\t", header = FALSE)
+colnames(tsr) <- header
+gb <- read.csv(gbTable, sep = "\t", header = FALSE)
+colnames(gb) <- header
+
+
+#Compute PI by simply divide the TSR region average signal by the GB region average signal and compile the table
+ti_out <- data.frame(name=tsr$name, TR=gb$mean_over_all/tsr$mean_over_all)
+write.table(ti_out, file=outputfile, col.names = FALSE, row.names = FALSE, sep = "\t", quote = FALSE)
+```
+
+5. Plot the CDF to see how the signal distributes, choose a cutoff based on this 
+
+```{r}
+df <- read.table("sample.bw.genes.hg19.TR.txt", header = FALSE)
+colnames(df) <- c("regionName", "TravelRatio")
+df_meanoverall <- data.frame(df$TravelRatio)
+melted_df_meanoverall <- melt(df_meanoverall)
+p0 = ggplot(melted_df_meanoverall, aes(x = value)) + 
+  #xlim(0,10) + 
+  stat_ecdf(aes(group = variable, colour = variable), geom = "point", size = 0.2)
+print(p0)
+```
